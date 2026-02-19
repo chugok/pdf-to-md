@@ -245,7 +245,7 @@ async function ocrBookPages(
   return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
 }
 
-function chunkText(text: string, maxSize: number = 4000): string[] {
+function chunkText(text: string, maxSize: number = 16000): string[] {
   const paragraphs = text.split('\n\n');
   const chunks: string[] = [];
   let current = '';
@@ -267,7 +267,7 @@ async function correctText(
 ): Promise<string> {
   const chunks = chunkText(text);
   const results: string[] = [];
-  const CONCURRENCY = 3;
+  const CONCURRENCY = 5;
 
   for (let i = 0; i < chunks.length; i += CONCURRENCY) {
     const batch = chunks.slice(i, Math.min(i + CONCURRENCY, chunks.length));
