@@ -102,6 +102,51 @@ async function ocrPages(
   return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
 }
 
+function chunkText(text: string, maxSize: number = 4000): string[] {
+  const paragraphs = text.split('\n\n');
+  const chunks: string[] = [];
+  let current = '';
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > maxSize && current) {
+      chunks.push(current);
+      current = para;
+    } else {
+      current = current ? current + '\n\n' + para : para;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function correctText(
+  text: string,
+  onProgress: (cur: number, tot: number) => void
+): Promise<string> {
+  const chunks = chunkText(text);
+  const results: string[] = [];
+  const CONCURRENCY = 3;
+
+  for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+    const batch = chunks.slice(i, Math.min(i + CONCURRENCY, chunks.length));
+    const batchResults = await Promise.all(
+      batch.map(async (chunk) => {
+        const res = await fetch('/api/correct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: chunk }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Correction failed');
+        return data.corrected;
+      })
+    );
+    results.push(...batchResults);
+    onProgress(Math.min(i + CONCURRENCY, chunks.length), chunks.length);
+  }
+
+  return results.join('\n\n');
+}
+
 function formatText(rawText: string, fileName: string): string {
   const cleaned = rawText
     .replace(/\r\n/g, '\n')
@@ -125,6 +170,7 @@ export default function Home() {
   const [dragOver, setDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
   const [progress, setProgress] = useState<Progress>(null);
+  const [autoCorrect, setAutoCorrect] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback((f: File) => {
@@ -182,6 +228,13 @@ export default function Home() {
           resultPages = ocrResult.pages;
           resultMethod = 'ocr';
         }
+      }
+
+      if (autoCorrect) {
+        setProgress({ phase: 'AI 교정', current: 0, total: 0 });
+        resultText = await correctText(resultText, (cur, tot) =>
+          setProgress({ phase: 'AI 교정', current: cur, total: tot })
+        );
       }
 
       setMarkdown(resultText);
@@ -260,6 +313,34 @@ export default function Home() {
         }
         .mode-label { font-size: 13px; font-weight: 600; }
         .mode-desc { font-size: 10px; opacity: 0.7; }
+        .option-row {
+          display: flex; align-items: center; justify-content: center; gap: 10px;
+          margin-bottom: 24px;
+        }
+        .toggle-label {
+          display: flex; align-items: center; gap: 10px; cursor: pointer;
+          padding: 8px 18px; border-radius: 10px;
+          background: rgba(15, 15, 25, 0.6); border: 1px solid rgba(100, 116, 139, 0.15);
+          transition: all 0.2s ease; user-select: none;
+        }
+        .toggle-label:hover { border-color: rgba(168, 85, 247, 0.3); }
+        .toggle-label.active {
+          background: rgba(168, 85, 247, 0.1); border-color: rgba(168, 85, 247, 0.3);
+        }
+        .toggle-switch {
+          width: 36px; height: 20px; border-radius: 10px;
+          background: rgba(100, 116, 139, 0.3); position: relative;
+          transition: background 0.2s ease; flex-shrink: 0;
+        }
+        .toggle-switch.on { background: rgba(168, 85, 247, 0.6); }
+        .toggle-switch::after {
+          content: ''; position: absolute; top: 2px; left: 2px;
+          width: 16px; height: 16px; border-radius: 50%;
+          background: #e2e8f0; transition: transform 0.2s ease;
+        }
+        .toggle-switch.on::after { transform: translateX(16px); }
+        .toggle-text { font-size: 13px; color: #94a3b8; font-weight: 500; }
+        .toggle-label.active .toggle-text { color: #c4b5fd; }
         .dropzone {
           border: 2px dashed rgba(100, 116, 139, 0.3); border-radius: 16px;
           padding: 56px 32px; text-align: center; cursor: pointer;
@@ -332,6 +413,7 @@ export default function Home() {
         .tag-pages { color: #64748b; background: rgba(100, 116, 139, 0.1); }
         .tag-text { color: #4ade80; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.15); }
         .tag-ocr { color: #a78bfa; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.15); }
+        .tag-corrected { color: #c4b5fd; background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.15); }
         .result-actions { display: flex; gap: 8px; }
         .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 8px; }
         .output {
@@ -381,6 +463,15 @@ export default function Home() {
             <button className={`mode-btn ${mode === 'ocr' ? 'active' : ''}`} onClick={() => setMode('ocr')}>
               <span className="mode-label">🔍 OCR</span><span className="mode-desc">스캔/이미지 PDF</span>
             </button>
+          </div>
+          <div className="option-row">
+            <div
+              className={`toggle-label ${autoCorrect ? 'active' : ''}`}
+              onClick={() => setAutoCorrect(!autoCorrect)}
+            >
+              <div className={`toggle-switch ${autoCorrect ? 'on' : ''}`} />
+              <span className="toggle-text">AI 자동 교정 (띄어쓰기·맞춤법)</span>
+            </div>
           </div>
           <div
             className={`dropzone ${dragOver ? 'dragover' : ''} ${file ? 'has-file' : ''}`}
@@ -439,6 +530,7 @@ export default function Home() {
                   <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : 'tag-text'}`}>
                     {method === 'ocr' ? '🔍 OCR (Claude Vision)' : '📝 텍스트 추출'}
                   </span>
+                  {autoCorrect && <span className="result-tag tag-corrected">✨ AI 교정</span>}
                 </div>
                 <div className="result-actions">
                   <button className="btn btn-sm btn-secondary" onClick={copyToClipboard}>

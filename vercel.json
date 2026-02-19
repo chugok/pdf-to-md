@@ -7,6 +7,10 @@
     "app/api/ocr/route.ts": {
       "maxDuration": 60,
       "memory": 1024
+    },
+    "app/api/correct/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
     }
   }
 }
