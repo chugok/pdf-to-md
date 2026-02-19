@@ -57,7 +57,8 @@ async function renderPageToBlob(pdfDoc: any, pageNum: number): Promise<Blob> {
 
 async function ocrPages(
   file: File,
-  onProgress: (cur: number, tot: number) => void
+  onProgress: (cur: number, tot: number) => void,
+  signal?: AbortSignal
 ): Promise<{ text: string; pages: number }> {
   const pdfjsLib = await getPdfjs();
   const arrayBuffer = await file.arrayBuffer();
@@ -83,7 +84,7 @@ async function ocrPages(
             const blob = await renderPageToBlob(pdf, p);
             formData.append('images', blob, `page_${p}.jpg`);
           }
-          const res = await fetch('/api/ocr', { method: 'POST', body: formData });
+          const res = await fetch('/api/ocr', { method: 'POST', body: formData, signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'OCR failed');
           return data.markdown;
@@ -198,7 +199,8 @@ async function extractBookText(
 
 async function ocrBookPages(
   file: File,
-  onProgress: (cur: number, tot: number) => void
+  onProgress: (cur: number, tot: number) => void,
+  signal?: AbortSignal
 ): Promise<{ text: string; pages: number }> {
   const pdfjsLib = await getPdfjs();
   const arrayBuffer = await file.arrayBuffer();
@@ -226,7 +228,7 @@ async function ocrBookPages(
           }
           formData.append('mode', 'book');
           formData.append('startPage', String(startPage));
-          const res = await fetch('/api/ocr', { method: 'POST', body: formData });
+          const res = await fetch('/api/ocr', { method: 'POST', body: formData, signal });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'OCR failed');
           return data.markdown;
@@ -263,7 +265,8 @@ function chunkText(text: string, maxSize: number = 16000): string[] {
 
 async function correctText(
   text: string,
-  onProgress: (cur: number, tot: number) => void
+  onProgress: (cur: number, tot: number) => void,
+  signal?: AbortSignal
 ): Promise<string> {
   const chunks = chunkText(text);
   const results: string[] = [];
@@ -277,6 +280,7 @@ async function correctText(
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: chunk }),
+          signal,
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Correction failed');
@@ -315,6 +319,7 @@ export default function Home() {
   const [progress, setProgress] = useState<Progress>(null);
   const [autoCorrect, setAutoCorrect] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const handleFile = useCallback((f: File) => {
     if (f.type !== 'application/pdf') { setError('PDF 파일만 업로드 가능합니다.'); return; }
@@ -330,6 +335,8 @@ export default function Home() {
 
   const convert = async () => {
     if (!file) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true); setError(''); setProgress(null);
 
     try {
@@ -348,7 +355,8 @@ export default function Home() {
       } else if (mode === 'ocr') {
         setProgress({ phase: 'OCR 처리', current: 0, total: 0 });
         const { text, pages: p } = await ocrPages(file, (cur, tot) =>
-          setProgress({ phase: 'OCR 처리', current: cur, total: tot })
+          setProgress({ phase: 'OCR 처리', current: cur, total: tot }),
+          controller.signal
         );
         resultText = formatText(text, file.name);
         resultPages = p;
@@ -365,7 +373,8 @@ export default function Home() {
         } else {
           setProgress({ phase: 'OCR 처리 (책)', current: 0, total: 0 });
           const ocrResult = await ocrBookPages(file, (cur, tot) =>
-            setProgress({ phase: 'OCR 처리 (책)', current: cur, total: tot })
+            setProgress({ phase: 'OCR 처리 (책)', current: cur, total: tot }),
+            controller.signal
           );
           resultText = formatText(ocrResult.text, file.name);
           resultPages = ocrResult.pages;
@@ -383,7 +392,8 @@ export default function Home() {
         } else {
           setProgress({ phase: 'OCR 전환 (텍스트 없음)', current: 0, total: 0 });
           const ocrResult = await ocrPages(file, (cur, tot) =>
-            setProgress({ phase: 'OCR 처리', current: cur, total: tot })
+            setProgress({ phase: 'OCR 처리', current: cur, total: tot }),
+            controller.signal
           );
           resultText = formatText(ocrResult.text, file.name);
           resultPages = ocrResult.pages;
@@ -394,7 +404,8 @@ export default function Home() {
       if (autoCorrect) {
         setProgress({ phase: 'AI 교정', current: 0, total: 0 });
         resultText = await correctText(resultText, (cur, tot) =>
-          setProgress({ phase: 'AI 교정', current: cur, total: tot })
+          setProgress({ phase: 'AI 교정', current: cur, total: tot }),
+          controller.signal
         );
       }
 
@@ -403,10 +414,18 @@ export default function Home() {
       setPages(resultPages);
       setMethod(resultMethod);
     } catch (err: any) {
-      setError(err.message || '변환 중 오류가 발생했습니다.');
+      if (err.name === 'AbortError') {
+        setError('변환이 취소되었습니다.');
+      } else {
+        setError(err.message || '변환 중 오류가 발생했습니다.');
+      }
     } finally {
-      setLoading(false); setProgress(null);
+      setLoading(false); setProgress(null); abortRef.current = null;
     }
+  };
+
+  const cancelConvert = () => {
+    abortRef.current?.abort();
   };
 
   const copyToClipboard = async () => {
@@ -537,6 +556,8 @@ export default function Home() {
           box-shadow: 0 4px 14px rgba(59, 130, 246, 0.25);
         }
         .btn-primary:hover:not(:disabled) { box-shadow: 0 6px 20px rgba(59, 130, 246, 0.35); transform: translateY(-1px); }
+        .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+        .btn-danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.25); }
         .btn-secondary { background: rgba(100, 116, 139, 0.12); color: #94a3b8; border: 1px solid rgba(100, 116, 139, 0.2); }
         .btn-secondary:hover:not(:disabled) { background: rgba(100, 116, 139, 0.2); color: #e2e8f0; }
         .btn-success { background: rgba(34, 197, 94, 0.12); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.2); }
@@ -667,7 +688,8 @@ export default function Home() {
             <button className="btn btn-primary" onClick={convert} disabled={!file || loading}>
               {loading ? (<><div className="spinner" />변환 중...</>) : '🔄 변환하기'}
             </button>
-            {file && <button className="btn btn-secondary" onClick={reset}>초기화</button>}
+            {loading && <button className="btn btn-danger" onClick={cancelConvert}>⏹ 중단</button>}
+            {file && !loading && <button className="btn btn-secondary" onClick={reset}>초기화</button>}
           </div>
           {loading && progress && (
             <div className="progress-container">
