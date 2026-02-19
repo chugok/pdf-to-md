@@ -243,7 +243,7 @@ async function ocrBookPages(
   return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
 }
 
-function chunkText(text: string, maxSize: number = 10000): string[] {
+function chunkText(text: string, maxSize: number = 3000): string[] {
   const paragraphs = text.split('\n\n');
   const chunks: string[] = [];
   let current = '';
