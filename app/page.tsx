@@ -328,6 +328,11 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    window.location.href = '/login';
+  };
+
   const handleFile = useCallback((f: File) => {
     if (f.type !== 'application/pdf') { setError('PDF 파일만 업로드 가능합니다.'); return; }
     if (f.size > MAX_FILE_SIZE) { setError('파일 크기는 500MB 이하여야 합니다.'); return; }
@@ -623,6 +628,15 @@ export default function Home() {
         .output-content::-webkit-scrollbar { width: 6px; }
         .output-content::-webkit-scrollbar-track { background: transparent; }
         .output-content::-webkit-scrollbar-thumb { background: rgba(100, 116, 139, 0.3); border-radius: 3px; }
+        .logout-bar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+        .logout-btn {
+          padding: 6px 14px; border-radius: 8px; font-size: 12px; font-weight: 500;
+          font-family: 'Noto Sans KR', sans-serif; cursor: pointer;
+          background: rgba(100, 116, 139, 0.08); color: #64748b;
+          border: 1px solid rgba(100, 116, 139, 0.12);
+          transition: all 0.2s ease;
+        }
+        .logout-btn:hover { background: rgba(239, 68, 68, 0.08); color: #f87171; border-color: rgba(239, 68, 68, 0.15); }
         .footer {
           text-align: center; margin-top: 48px; padding-top: 24px;
           border-top: 1px solid rgba(100, 116, 139, 0.1); font-size: 13px; color: #475569;
@@ -638,6 +652,9 @@ export default function Home() {
       `}</style>
       <div className="page">
         <div className="container">
+          <div className="logout-bar">
+            <button className="logout-btn" onClick={handleLogout}>로그아웃</button>
+          </div>
           <header className="header">
             <div className="badge">Oxford Academy Tools</div>
             <h1 className="title">PDF → Markdown</h1>
