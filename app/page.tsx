@@ -84,9 +84,7 @@ async function ocrPages(
             const blob = await renderPageToBlob(pdf, p);
             formData.append('images', blob, `page_${p}.jpg`);
           }
-          const res = await fetch('/api/ocr', { method: 'POST', body: formData, signal });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || 'OCR failed');
+          const data = await safeFetch('/api/ocr', { method: 'POST', body: formData, signal });
           return data.markdown;
         })()
       );
@@ -228,9 +226,7 @@ async function ocrBookPages(
           }
           formData.append('mode', 'book');
           formData.append('startPage', String(startPage));
-          const res = await fetch('/api/ocr', { method: 'POST', body: formData, signal });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || 'OCR failed');
+          const data = await safeFetch('/api/ocr', { method: 'POST', body: formData, signal });
           return data.markdown;
         })()
       );
@@ -247,7 +243,7 @@ async function ocrBookPages(
   return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
 }
 
-function chunkText(text: string, maxSize: number = 16000): string[] {
+function chunkText(text: string, maxSize: number = 10000): string[] {
   const paragraphs = text.split('\n\n');
   const chunks: string[] = [];
   let current = '';
@@ -263,6 +259,19 @@ function chunkText(text: string, maxSize: number = 16000): string[] {
   return chunks;
 }
 
+async function safeFetch(url: string, options: RequestInit): Promise<any> {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`서버 오류 (${res.status}): ${text.slice(0, 100)}`);
+  }
+  if (!res.ok) throw new Error(data.error || `요청 실패 (${res.status})`);
+  return data;
+}
+
 async function correctText(
   text: string,
   onProgress: (cur: number, tot: number) => void,
@@ -270,20 +279,18 @@ async function correctText(
 ): Promise<string> {
   const chunks = chunkText(text);
   const results: string[] = [];
-  const CONCURRENCY = 5;
+  const CONCURRENCY = 3;
 
   for (let i = 0; i < chunks.length; i += CONCURRENCY) {
     const batch = chunks.slice(i, Math.min(i + CONCURRENCY, chunks.length));
     const batchResults = await Promise.all(
       batch.map(async (chunk) => {
-        const res = await fetch('/api/correct', {
+        const data = await safeFetch('/api/correct', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: chunk }),
           signal,
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Correction failed');
         return data.corrected;
       })
     );
