@@ -9,6 +9,7 @@ export async function POST(request: NextRequest) {
     const formData = await request.formData();
     const file = formData.get('file') as File;
     const mode = (formData.get('mode') as string) || 'auto';
+    const isChunk = formData.get('chunk') === 'true';
 
     if (!file) {
       return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
@@ -47,11 +48,11 @@ export async function POST(request: NextRequest) {
       }
 
       const ocrResult = await ocrWithVision(buffer, apiKey);
-      markdown = formatMarkdown(ocrResult.text, file.name, true);
+      markdown = isChunk ? ocrResult.text : formatMarkdown(ocrResult.text, file.name, true);
       numpages = ocrResult.pages || numpages;
       method = 'ocr';
     } else {
-      markdown = formatMarkdown(textResult, file.name, false);
+      markdown = isChunk ? cleanText(textResult) : formatMarkdown(textResult, file.name, false);
       method = 'text';
     }
 
@@ -174,6 +175,15 @@ function formatMarkdown(text: string, fileName: string, fromOCR: boolean): strin
 
   const title = fileName.replace('.pdf', '').replace(/[-_]/g, ' ');
   return `# ${title}\n\n${formattedLines.join('\n')}`;
+}
+
+function cleanText(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\ufeff/g, '')
+    .replace(/\u00a0/g, ' ');
 }
 
 function titleCase(str: string): string {

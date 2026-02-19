@@ -3,6 +3,37 @@
 import { useState, useCallback, useRef } from 'react';
 
 type Mode = 'auto' | 'text' | 'ocr';
+type Progress = { phase: 'splitting' | 'converting'; current: number; total: number } | null;
+
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
+const CHUNK_THRESHOLD = 4 * 1024 * 1024;
+const PAGES_PER_CHUNK = 10;
+
+async function splitPdf(file: File): Promise<{ chunks: Blob[]; totalPages: number }> {
+  if (file.size <= CHUNK_THRESHOLD) {
+    return {
+      chunks: [new Blob([await file.arrayBuffer()], { type: 'application/pdf' })],
+      totalPages: 0,
+    };
+  }
+
+  const { PDFDocument } = await import('pdf-lib');
+  const arrayBuffer = await file.arrayBuffer();
+  const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+  const totalPages = pdfDoc.getPageCount();
+  const chunks: Blob[] = [];
+
+  for (let start = 0; start < totalPages; start += PAGES_PER_CHUNK) {
+    const end = Math.min(start + PAGES_PER_CHUNK, totalPages);
+    const chunkDoc = await PDFDocument.create();
+    const indices = Array.from({ length: end - start }, (_, i) => start + i);
+    const copiedPages = await chunkDoc.copyPages(pdfDoc, indices);
+    copiedPages.forEach((page) => chunkDoc.addPage(page));
+    chunks.push(new Blob([await chunkDoc.save()], { type: 'application/pdf' }));
+  }
+
+  return { chunks, totalPages };
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -15,11 +46,12 @@ export default function Home() {
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [progress, setProgress] = useState<Progress>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFile = useCallback((f: File) => {
     if (f.type !== 'application/pdf') { setError('PDF 파일만 업로드 가능합니다.'); return; }
-    if (f.size > 50 * 1024 * 1024) { setError('파일 크기는 50MB 이하여야 합니다.'); return; }
+    if (f.size > MAX_FILE_SIZE) { setError('파일 크기는 500MB 이하여야 합니다.'); return; }
     setFile(f); setError(''); setMarkdown('');
   }, []);
 
@@ -31,17 +63,58 @@ export default function Home() {
 
   const convert = async () => {
     if (!file) return;
-    setLoading(true); setError('');
+    setLoading(true); setError(''); setProgress(null);
+
     try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('mode', mode);
-      const res = await fetch('/api/convert', { method: 'POST', body: formData });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Conversion failed');
-      setMarkdown(data.markdown); setFileName(data.fileName); setPages(data.pages); setMethod(data.method);
-    } catch (err: any) { setError(err.message || '변환 중 오류가 발생했습니다.'); }
-    finally { setLoading(false); }
+      setProgress({ phase: 'splitting', current: 0, total: 0 });
+      const { chunks, totalPages } = await splitPdf(file);
+      const isChunked = chunks.length > 1;
+
+      setProgress({ phase: 'converting', current: 0, total: chunks.length });
+
+      const results: { markdown: string; method: string; pages: number }[] = [];
+      const CONCURRENCY = mode === 'ocr' ? 2 : 3;
+
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const batch = chunks.slice(i, Math.min(i + CONCURRENCY, chunks.length));
+        const batchResults = await Promise.all(
+          batch.map(async (chunk) => {
+            const formData = new FormData();
+            formData.append('file', chunk, file.name);
+            formData.append('mode', mode);
+            if (isChunked) formData.append('chunk', 'true');
+
+            const res = await fetch('/api/convert', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Conversion failed');
+            return data;
+          })
+        );
+        results.push(...batchResults);
+        setProgress({ phase: 'converting', current: Math.min(i + CONCURRENCY, chunks.length), total: chunks.length });
+      }
+
+      let combined: string;
+      if (isChunked) {
+        const title = file.name.replace('.pdf', '').replace(/[-_]/g, ' ');
+        combined = `# ${title}\n\n${results.map((r) => r.markdown).join('\n\n---\n\n')}`;
+      } else {
+        combined = results[0].markdown;
+      }
+
+      const methods = [...new Set(results.map((r) => r.method))];
+      const finalMethod = methods.length === 1 ? methods[0] : 'mixed';
+      const finalPages = totalPages || results.reduce((sum, r) => sum + (r.pages || 0), 0);
+
+      setMarkdown(combined);
+      setFileName(file.name.replace('.pdf', '.md'));
+      setPages(finalPages);
+      setMethod(finalMethod);
+    } catch (err: any) {
+      setError(err.message || '변환 중 오류가 발생했습니다.');
+    } finally {
+      setLoading(false); setProgress(null);
+    }
   };
 
   const copyToClipboard = async () => {
@@ -58,7 +131,7 @@ export default function Home() {
   };
 
   const reset = () => {
-    setFile(null); setMarkdown(''); setFileName(''); setPages(0); setMethod(''); setError('');
+    setFile(null); setMarkdown(''); setFileName(''); setPages(0); setMethod(''); setError(''); setProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -157,7 +230,19 @@ export default function Home() {
           border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 10px; color: #f87171;
           font-size: 14px; text-align: center;
         }
-        .loading-info { margin-top: 16px; text-align: center; color: #64748b; font-size: 13px; animation: pulse 2s ease-in-out infinite; }
+        .progress-container { margin-top: 16px; max-width: 480px; margin-left: auto; margin-right: auto; }
+        .progress-bar {
+          height: 6px; background: rgba(100, 116, 139, 0.15);
+          border-radius: 3px; overflow: hidden; margin-bottom: 8px;
+        }
+        .progress-fill {
+          height: 100%; background: linear-gradient(90deg, #3b82f6, #60a5fa);
+          border-radius: 3px; transition: width 0.3s ease;
+        }
+        .progress-text {
+          text-align: center; font-size: 13px; color: #64748b;
+          animation: pulse 2s ease-in-out infinite;
+        }
         @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
         .result { margin-top: 32px; animation: fadeIn 0.4s ease; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -168,6 +253,7 @@ export default function Home() {
         .tag-pages { color: #64748b; background: rgba(100, 116, 139, 0.1); }
         .tag-text { color: #4ade80; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.15); }
         .tag-ocr { color: #a78bfa; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.15); }
+        .tag-mixed { color: #fbbf24; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.15); }
         .result-actions { display: flex; gap: 8px; }
         .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 8px; }
         .output {
@@ -239,7 +325,7 @@ export default function Home() {
               <>
                 <div className="drop-icon">📎</div>
                 <div className="drop-text">PDF 파일을 여기에 드래그하거나 클릭하여 선택</div>
-                <div className="drop-hint">최대 50MB · PDF 파일만 지원</div>
+                <div className="drop-hint">최대 500MB · PDF 파일만 지원</div>
               </>
             )}
           </div>
@@ -249,9 +335,20 @@ export default function Home() {
             </button>
             {file && <button className="btn btn-secondary" onClick={reset}>초기화</button>}
           </div>
-          {loading && mode !== 'text' && (
-            <div className="loading-info">
-              {mode === 'ocr' ? '🔍 Claude Vision으로 OCR 처리 중... (30초~2분 소요)' : '⚡ 텍스트 추출 시도 중... 텍스트가 없으면 OCR로 전환됩니다'}
+          {loading && progress && (
+            <div className="progress-container">
+              {progress.phase === 'splitting' ? (
+                <div className="progress-text">📄 PDF 분석 중...</div>
+              ) : (
+                <>
+                  <div className="progress-bar">
+                    <div className="progress-fill" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
+                  </div>
+                  <div className="progress-text">
+                    {mode === 'ocr' ? '🔍 OCR' : '⚡'} 변환 중... ({progress.current}/{progress.total})
+                  </div>
+                </>
+              )}
             </div>
           )}
           {error && <div className="error">⚠️ {error}</div>}
@@ -261,8 +358,8 @@ export default function Home() {
                 <div className="result-meta">
                   <span className="result-label">✅ 변환 완료</span>
                   <span className="result-tag tag-pages">{pages}페이지</span>
-                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : 'tag-text'}`}>
-                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : '📝 텍스트 추출'}
+                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : method === 'mixed' ? 'tag-mixed' : 'tag-text'}`}>
+                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : method === 'mixed' ? '⚡🔍 텍스트+OCR' : '📝 텍스트 추출'}
                   </span>
                 </div>
                 <div className="result-actions">
