@@ -1,12 +1,12 @@
 {
   "functions": {
     "app/api/convert/route.ts": {
-      "maxDuration": 300,
-      "memory": 3009
+      "maxDuration": 60,
+      "memory": 1024
     },
     "app/api/ocr/route.ts": {
-      "maxDuration": 300,
-      "memory": 3009
+      "maxDuration": 60,
+      "memory": 1024
     }
   }
 }
