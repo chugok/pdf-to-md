@@ -3,6 +3,10 @@
     "app/api/convert/route.ts": {
       "maxDuration": 300,
       "memory": 3009
+    },
+    "app/api/ocr/route.ts": {
+      "maxDuration": 300,
+      "memory": 3009
     }
   }
 }

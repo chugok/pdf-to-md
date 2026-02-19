@@ -3,36 +3,114 @@
 import { useState, useCallback, useRef } from 'react';
 
 type Mode = 'auto' | 'text' | 'ocr';
-type Progress = { phase: 'splitting' | 'converting'; current: number; total: number } | null;
+type Progress = { phase: string; current: number; total: number } | null;
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
-const CHUNK_THRESHOLD = 4 * 1024 * 1024;
-const PAGES_PER_CHUNK = 10;
 
-async function splitPdf(file: File): Promise<{ chunks: Blob[]; totalPages: number }> {
-  if (file.size <= CHUNK_THRESHOLD) {
-    return {
-      chunks: [new Blob([await file.arrayBuffer()], { type: 'application/pdf' })],
-      totalPages: 0,
-    };
-  }
+async function getPdfjs() {
+  const pdfjsLib = await import('pdfjs-dist');
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+  return pdfjsLib;
+}
 
-  const { PDFDocument } = await import('pdf-lib');
+async function extractText(
+  file: File,
+  onProgress: (cur: number, tot: number) => void
+): Promise<{ text: string; pages: number; hasText: boolean }> {
+  const pdfjsLib = await getPdfjs();
   const arrayBuffer = await file.arrayBuffer();
-  const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
-  const totalPages = pdfDoc.getPageCount();
-  const chunks: Blob[] = [];
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
-  for (let start = 0; start < totalPages; start += PAGES_PER_CHUNK) {
-    const end = Math.min(start + PAGES_PER_CHUNK, totalPages);
-    const chunkDoc = await PDFDocument.create();
-    const indices = Array.from({ length: end - start }, (_, i) => start + i);
-    const copiedPages = await chunkDoc.copyPages(pdfDoc, indices);
-    copiedPages.forEach((page) => chunkDoc.addPage(page));
-    chunks.push(new Blob([await chunkDoc.save()], { type: 'application/pdf' }));
+  const pageTexts: string[] = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const text = content.items
+      .filter((item: any) => 'str' in item)
+      .map((item: any) => item.str)
+      .join(' ')
+      .trim();
+    pageTexts.push(text);
+    page.cleanup();
+    onProgress(i, pdf.numPages);
   }
 
-  return { chunks, totalPages };
+  const fullText = pageTexts.join('\n\n');
+  const hasText = fullText.trim().length > 50;
+  pdf.destroy();
+  return { text: fullText, pages: pdf.numPages, hasText };
+}
+
+async function renderPageToBlob(pdfDoc: any, pageNum: number): Promise<Blob> {
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale: 1.5 });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d')!;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  page.cleanup();
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob!), 'image/jpeg', 0.8);
+  });
+}
+
+async function ocrPages(
+  file: File,
+  onProgress: (cur: number, tot: number) => void
+): Promise<{ text: string; pages: number }> {
+  const pdfjsLib = await getPdfjs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  const results: string[] = [];
+  const BATCH = 3;
+  const CONCURRENCY = 2;
+  const totalBatches = Math.ceil(pdf.numPages / BATCH);
+
+  for (let b = 0; b < totalBatches; b += CONCURRENCY) {
+    const promises: Promise<string>[] = [];
+
+    for (let c = 0; c < CONCURRENCY && b + c < totalBatches; c++) {
+      const idx = b + c;
+      const startPage = idx * BATCH + 1;
+      const endPage = Math.min(startPage + BATCH - 1, pdf.numPages);
+
+      promises.push(
+        (async () => {
+          const formData = new FormData();
+          for (let p = startPage; p <= endPage; p++) {
+            const blob = await renderPageToBlob(pdf, p);
+            formData.append('images', blob, `page_${p}.jpg`);
+          }
+          const res = await fetch('/api/ocr', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'OCR failed');
+          return data.markdown;
+        })()
+      );
+    }
+
+    const batchResults = await Promise.all(promises);
+    results.push(...batchResults);
+
+    const done = Math.min((b + CONCURRENCY) * BATCH, pdf.numPages);
+    onProgress(done, pdf.numPages);
+  }
+
+  pdf.destroy();
+  return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
+}
+
+function formatText(rawText: string, fileName: string): string {
+  const cleaned = rawText
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\ufeff/g, '')
+    .replace(/\u00a0/g, ' ');
+  const title = fileName.replace('.pdf', '').replace(/[-_]/g, ' ');
+  return `# ${title}\n\n${cleaned}`;
 }
 
 export default function Home() {
@@ -66,50 +144,50 @@ export default function Home() {
     setLoading(true); setError(''); setProgress(null);
 
     try {
-      setProgress({ phase: 'splitting', current: 0, total: 0 });
-      const { chunks, totalPages } = await splitPdf(file);
-      const isChunked = chunks.length > 1;
+      let resultText: string;
+      let resultPages: number;
+      let resultMethod: string;
 
-      setProgress({ phase: 'converting', current: 0, total: chunks.length });
-
-      const results: { markdown: string; method: string; pages: number }[] = [];
-      const CONCURRENCY = mode === 'ocr' ? 2 : 3;
-
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const batch = chunks.slice(i, Math.min(i + CONCURRENCY, chunks.length));
-        const batchResults = await Promise.all(
-          batch.map(async (chunk) => {
-            const formData = new FormData();
-            formData.append('file', chunk, file.name);
-            formData.append('mode', mode);
-            if (isChunked) formData.append('chunk', 'true');
-
-            const res = await fetch('/api/convert', { method: 'POST', body: formData });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || 'Conversion failed');
-            return data;
-          })
+      if (mode === 'text') {
+        setProgress({ phase: '텍스트 추출', current: 0, total: 0 });
+        const { text, pages: p } = await extractText(file, (cur, tot) =>
+          setProgress({ phase: '텍스트 추출', current: cur, total: tot })
         );
-        results.push(...batchResults);
-        setProgress({ phase: 'converting', current: Math.min(i + CONCURRENCY, chunks.length), total: chunks.length });
-      }
-
-      let combined: string;
-      if (isChunked) {
-        const title = file.name.replace('.pdf', '').replace(/[-_]/g, ' ');
-        combined = `# ${title}\n\n${results.map((r) => r.markdown).join('\n\n---\n\n')}`;
+        resultText = formatText(text, file.name);
+        resultPages = p;
+        resultMethod = 'text';
+      } else if (mode === 'ocr') {
+        setProgress({ phase: 'OCR 처리', current: 0, total: 0 });
+        const { text, pages: p } = await ocrPages(file, (cur, tot) =>
+          setProgress({ phase: 'OCR 처리', current: cur, total: tot })
+        );
+        resultText = formatText(text, file.name);
+        resultPages = p;
+        resultMethod = 'ocr';
       } else {
-        combined = results[0].markdown;
+        setProgress({ phase: '텍스트 추출', current: 0, total: 0 });
+        const { text, pages: p, hasText } = await extractText(file, (cur, tot) =>
+          setProgress({ phase: '텍스트 추출', current: cur, total: tot })
+        );
+        if (hasText) {
+          resultText = formatText(text, file.name);
+          resultPages = p;
+          resultMethod = 'text';
+        } else {
+          setProgress({ phase: 'OCR 전환 (텍스트 없음)', current: 0, total: 0 });
+          const ocrResult = await ocrPages(file, (cur, tot) =>
+            setProgress({ phase: 'OCR 처리', current: cur, total: tot })
+          );
+          resultText = formatText(ocrResult.text, file.name);
+          resultPages = ocrResult.pages;
+          resultMethod = 'ocr';
+        }
       }
 
-      const methods = [...new Set(results.map((r) => r.method))];
-      const finalMethod = methods.length === 1 ? methods[0] : 'mixed';
-      const finalPages = totalPages || results.reduce((sum, r) => sum + (r.pages || 0), 0);
-
-      setMarkdown(combined);
+      setMarkdown(resultText);
       setFileName(file.name.replace('.pdf', '.md'));
-      setPages(finalPages);
-      setMethod(finalMethod);
+      setPages(resultPages);
+      setMethod(resultMethod);
     } catch (err: any) {
       setError(err.message || '변환 중 오류가 발생했습니다.');
     } finally {
@@ -131,7 +209,8 @@ export default function Home() {
   };
 
   const reset = () => {
-    setFile(null); setMarkdown(''); setFileName(''); setPages(0); setMethod(''); setError(''); setProgress(null);
+    setFile(null); setMarkdown(''); setFileName(''); setPages(0);
+    setMethod(''); setError(''); setProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -253,7 +332,6 @@ export default function Home() {
         .tag-pages { color: #64748b; background: rgba(100, 116, 139, 0.1); }
         .tag-text { color: #4ade80; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.15); }
         .tag-ocr { color: #a78bfa; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.15); }
-        .tag-mixed { color: #fbbf24; background: rgba(251, 191, 36, 0.1); border: 1px solid rgba(251, 191, 36, 0.15); }
         .result-actions { display: flex; gap: 8px; }
         .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 8px; }
         .output {
@@ -337,15 +415,15 @@ export default function Home() {
           </div>
           {loading && progress && (
             <div className="progress-container">
-              {progress.phase === 'splitting' ? (
-                <div className="progress-text">📄 PDF 분석 중...</div>
+              {progress.total === 0 ? (
+                <div className="progress-text">📄 {progress.phase}...</div>
               ) : (
                 <>
                   <div className="progress-bar">
                     <div className="progress-fill" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
                   </div>
                   <div className="progress-text">
-                    {mode === 'ocr' ? '🔍 OCR' : '⚡'} 변환 중... ({progress.current}/{progress.total})
+                    {progress.phase} ({progress.current}/{progress.total} 페이지)
                   </div>
                 </>
               )}
@@ -358,8 +436,8 @@ export default function Home() {
                 <div className="result-meta">
                   <span className="result-label">✅ 변환 완료</span>
                   <span className="result-tag tag-pages">{pages}페이지</span>
-                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : method === 'mixed' ? 'tag-mixed' : 'tag-text'}`}>
-                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : method === 'mixed' ? '⚡🔍 텍스트+OCR' : '📝 텍스트 추출'}
+                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : 'tag-text'}`}>
+                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : '📝 텍스트 추출'}
                   </span>
                 </div>
                 <div className="result-actions">
