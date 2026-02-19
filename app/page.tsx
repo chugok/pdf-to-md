@@ -701,7 +701,7 @@ export default function Home() {
                     <div className="progress-fill" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
                   </div>
                   <div className="progress-text">
-                    {progress.phase} ({progress.current}/{progress.total} 페이지)
+                    {progress.phase} ({progress.current}/{progress.total}) · {Math.round((progress.current / progress.total) * 100)}%
                   </div>
                 </>
               )}
