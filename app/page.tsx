@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 
-type Mode = 'auto' | 'text' | 'ocr';
+type Mode = 'auto' | 'text' | 'ocr' | 'book';
 type Progress = { phase: string; current: number; total: number } | null;
 
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
@@ -83,6 +83,149 @@ async function ocrPages(
             const blob = await renderPageToBlob(pdf, p);
             formData.append('images', blob, `page_${p}.jpg`);
           }
+          const res = await fetch('/api/ocr', { method: 'POST', body: formData });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'OCR failed');
+          return data.markdown;
+        })()
+      );
+    }
+
+    const batchResults = await Promise.all(promises);
+    results.push(...batchResults);
+
+    const done = Math.min((b + CONCURRENCY) * BATCH, pdf.numPages);
+    onProgress(done, pdf.numPages);
+  }
+
+  pdf.destroy();
+  return { text: results.join('\n\n---\n\n'), pages: pdf.numPages };
+}
+
+// --- Book mode helpers ---
+
+function isPageNumber(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  // "42", "- 42 -", "— 42 —", "page 42", "p.42", Roman numerals
+  if (/^[-–—]?\s*\d{1,4}\s*[-–—]?$/.test(t)) return true;
+  if (/^page\s+\d+$/i.test(t)) return true;
+  if (/^p\.\s*\d+$/i.test(t)) return true;
+  if (/^[ivxlcdm]+$/i.test(t) && t.length <= 8) return true;
+  return false;
+}
+
+function findRepeating(lines: string[], threshold: number): Set<string> {
+  const counts = new Map<string, number>();
+  for (const line of lines) {
+    const t = line?.trim();
+    if (t && t.length > 0 && t.length < 100) {
+      counts.set(t, (counts.get(t) || 0) + 1);
+    }
+  }
+  const minCount = Math.floor(lines.length * threshold);
+  const result = new Set<string>();
+  counts.forEach((count, text) => {
+    if (count >= minCount && count >= 3) result.add(text);
+  });
+  return result;
+}
+
+function cleanBookPages(rawPages: string[]): string[] {
+  // Detect repeating headers/footers
+  const firstLines = rawPages.map(t => t.split('\n')[0]?.trim() || '');
+  const lastLines = rawPages.map(t => {
+    const lines = t.split('\n');
+    return lines[lines.length - 1]?.trim() || '';
+  });
+  const repeatHeaders = findRepeating(firstLines, 0.3);
+  const repeatFooters = findRepeating(lastLines, 0.3);
+
+  return rawPages.map((text) => {
+    let lines = text.split('\n');
+
+    // Remove repeating header
+    if (lines.length > 0 && repeatHeaders.has(lines[0].trim())) {
+      lines.shift();
+    }
+    // Remove repeating footer
+    if (lines.length > 0 && repeatFooters.has(lines[lines.length - 1].trim())) {
+      lines.pop();
+    }
+    // Remove page numbers at start/end
+    if (lines.length > 0 && isPageNumber(lines[0])) lines.shift();
+    if (lines.length > 0 && isPageNumber(lines[lines.length - 1])) lines.pop();
+
+    return lines.join('\n').trim();
+  });
+}
+
+async function extractBookText(
+  file: File,
+  onProgress: (cur: number, tot: number) => void
+): Promise<{ text: string; pages: number; hasText: boolean }> {
+  const pdfjsLib = await getPdfjs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  const rawPages: string[] = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const text = content.items
+      .filter((item: any) => 'str' in item)
+      .map((item: any) => item.str)
+      .join(' ')
+      .trim();
+    rawPages.push(text);
+    page.cleanup();
+    onProgress(i, pdf.numPages);
+  }
+
+  const cleaned = cleanBookPages(rawPages);
+  const fullText = cleaned.join('\n\n');
+  const hasText = fullText.trim().length > 50;
+
+  // Format with page markers
+  const formatted = cleaned
+    .map((text, i) => text ? `[p.${i + 1}]\n${text}` : '')
+    .filter(Boolean)
+    .join('\n\n---\n\n');
+
+  pdf.destroy();
+  return { text: formatted, pages: pdf.numPages, hasText };
+}
+
+async function ocrBookPages(
+  file: File,
+  onProgress: (cur: number, tot: number) => void
+): Promise<{ text: string; pages: number }> {
+  const pdfjsLib = await getPdfjs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  const results: string[] = [];
+  const BATCH = 3;
+  const CONCURRENCY = 2;
+  const totalBatches = Math.ceil(pdf.numPages / BATCH);
+
+  for (let b = 0; b < totalBatches; b += CONCURRENCY) {
+    const promises: Promise<string>[] = [];
+
+    for (let c = 0; c < CONCURRENCY && b + c < totalBatches; c++) {
+      const idx = b + c;
+      const startPage = idx * BATCH + 1;
+      const endPage = Math.min(startPage + BATCH - 1, pdf.numPages);
+
+      promises.push(
+        (async () => {
+          const formData = new FormData();
+          for (let p = startPage; p <= endPage; p++) {
+            const blob = await renderPageToBlob(pdf, p);
+            formData.append('images', blob, `page_${p}.jpg`);
+          }
+          formData.append('mode', 'book');
+          formData.append('startPage', String(startPage));
           const res = await fetch('/api/ocr', { method: 'POST', body: formData });
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'OCR failed');
@@ -210,6 +353,24 @@ export default function Home() {
         resultText = formatText(text, file.name);
         resultPages = p;
         resultMethod = 'ocr';
+      } else if (mode === 'book') {
+        setProgress({ phase: '책 텍스트 추출', current: 0, total: 0 });
+        const { text, pages: p, hasText } = await extractBookText(file, (cur, tot) =>
+          setProgress({ phase: '책 텍스트 추출', current: cur, total: tot })
+        );
+        if (hasText) {
+          resultText = formatText(text, file.name);
+          resultPages = p;
+          resultMethod = 'book';
+        } else {
+          setProgress({ phase: 'OCR 처리 (책)', current: 0, total: 0 });
+          const ocrResult = await ocrBookPages(file, (cur, tot) =>
+            setProgress({ phase: 'OCR 처리 (책)', current: cur, total: tot })
+          );
+          resultText = formatText(ocrResult.text, file.name);
+          resultPages = ocrResult.pages;
+          resultMethod = 'book-ocr';
+        }
       } else {
         setProgress({ phase: '텍스트 추출', current: 0, total: 0 });
         const { text, pages: p, hasText } = await extractText(file, (cur, tot) =>
@@ -413,6 +574,7 @@ export default function Home() {
         .tag-pages { color: #64748b; background: rgba(100, 116, 139, 0.1); }
         .tag-text { color: #4ade80; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.15); }
         .tag-ocr { color: #a78bfa; background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.15); }
+        .tag-book { color: #fb923c; background: rgba(251, 146, 60, 0.1); border: 1px solid rgba(251, 146, 60, 0.15); }
         .tag-corrected { color: #c4b5fd; background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.15); }
         .result-actions { display: flex; gap: 8px; }
         .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 8px; }
@@ -462,6 +624,9 @@ export default function Home() {
             </button>
             <button className={`mode-btn ${mode === 'ocr' ? 'active' : ''}`} onClick={() => setMode('ocr')}>
               <span className="mode-label">🔍 OCR</span><span className="mode-desc">스캔/이미지 PDF</span>
+            </button>
+            <button className={`mode-btn ${mode === 'book' ? 'active' : ''}`} onClick={() => setMode('book')}>
+              <span className="mode-label">📖 책</span><span className="mode-desc">페이지번호 제거</span>
             </button>
           </div>
           <div className="option-row">
@@ -527,8 +692,8 @@ export default function Home() {
                 <div className="result-meta">
                   <span className="result-label">✅ 변환 완료</span>
                   <span className="result-tag tag-pages">{pages}페이지</span>
-                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : 'tag-text'}`}>
-                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : '📝 텍스트 추출'}
+                  <span className={`result-tag ${method === 'ocr' ? 'tag-ocr' : method.startsWith('book') ? 'tag-book' : 'tag-text'}`}>
+                    {method === 'ocr' ? '🔍 OCR (Claude Vision)' : method === 'book-ocr' ? '📖🔍 책 OCR' : method === 'book' ? '📖 책 추출' : '📝 텍스트 추출'}
                   </span>
                   {autoCorrect && <span className="result-tag tag-corrected">✨ AI 교정</span>}
                 </div>
